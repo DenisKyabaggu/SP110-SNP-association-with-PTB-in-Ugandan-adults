@@ -1,2 +1,2 @@
-# SP110-SNP-association-with-PTB-in-Ugandan-adults
+# SP110-SNP-association-with-PTB-in-UgandanS
 This a repository of the script used for the analysis of association of 10 SNPs in the SP110 gene with pulmonary tuberculosis in Uganda. The script runs the full pipeline including summarizing participant characteristics, determining allele frequencies and Hardy–Weinberg equilibrium and genotype counts. It also performs logistic-regression association under additive, dominant, recessive, and overdominant models and sensitivity analyses, and a post-hoc power calculation.
