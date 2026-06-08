@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""
+SP110 polymorphisms and pulmonary tuberculosis susceptibility
+Reference genome: GRCh37/hg19
+
+Usage:
+    python3 sp110_full_analysis.py \
+        --input data/genotypes.txt \
+        --outdir results/sp110 \
+        --duplicates config/duplicates_to_remove.csv
+"""
+
+import os
+import argparse
+import warnings
+import numpy as np
+import pandas as pd
+from scipy import stats
+from scipy.stats import chi2
+import statsmodels.api as sm
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+warnings.filterwarnings("ignore")
+
+# Paths and run options
+parser = argparse.ArgumentParser(
+    description="SP110 polymorphisms and PTB susceptibility analysis"
+)
+parser.add_argument("--input", default="data/genotypes.txt",
+                    help="Tab-delimited genotype/phenotype input file")
+parser.add_argument("--outdir", default="results/sp110",
+                    help="Directory for Excel and CSV outputs")
+parser.add_argument("--duplicates", default="config/duplicates_to_remove.csv",
+                    help="Optional CSV with removed_id, kept_id, and note columns")
+args = parser.parse_args()
+
+DATA_IN = args.input
+OUTDIR = args.outdir
+XLSX_OUT = os.path.join(OUTDIR, "SP110_Analysis_Tables.xlsx")
+os.makedirs(OUTDIR, exist_ok=True)
+
+
+def load_duplicates(path):
+    """Load duplicate records to remove without hard-coding participant IDs."""
+    if not path or not os.path.exists(path):
+        return []
+
+    duplicates = pd.read_csv(path, dtype=str).fillna("")
+    required = {"removed_id"}
+    missing = required.difference(duplicates.columns)
+    if missing:
+        raise ValueError(
+            f"Duplicate-removal file is missing required columns: {sorted(missing)}"
+        )
+
+    records = []
+    for _, row in duplicates.iterrows():
+        removed_id = str(row["removed_id"]).strip()
+        if not removed_id:
+            continue
+        records.append({
+            "removed_id": removed_id,
+            "kept_id": str(row.get("kept_id", "")).strip(),
+            "note": str(row.get("note", "")).strip(),
+        })
+    return records
+
+
+DUP_RECORDS = load_duplicates(args.duplicates)
+DROP_IDS = [record["removed_id"] for record in DUP_RECORDS]
+
+# SNP metadata (GRCh37/hg19)
+SNP_COLS = ["rs11556887","rs1346311","rs1427294","rs2114592","rs2241525",
+            "rs3948464","rs6436915","rs7580900","rs7580912","rs9061"]
+SNP_META = pd.DataFrame({
+    "SNP":      SNP_COLS,
+    "Chr":      ["2"] * 10,
+    "Pos_hg19": [231054278,231071489,231050657,231069625,231074227,
+                 231063974,231058786,231065851,231066577,231050946],
+    "Ref":      ["G","G","G","G","C","A","G","T","T","C"],
+    "Alt":      ["A","A","A","A","T","G","T","C","C","T"],
+})
+
+# SECTION 1: Load and clean data
+print("="*60)
+print("SP110 ANALYSIS — GRCh37/hg19")
+print("="*60)
+
+raw = pd.read_csv(DATA_IN, sep="\t", na_values=["NA",""])
+df  = raw[~raw["ID"].isin(DROP_IDS)].copy().reset_index(drop=True)
+
+print(f"\nRaw records      : {len(raw)}")
+print(f"Duplicates removed: {len(DROP_IDS)}")
+print(f"Unique participants: {len(df)}")
+
+df["PTB"]       = (df["status"] == "ATB").astype(int)
+df["PTB_label"] = np.where(df["PTB"]==1, "PTB+", "PTB-")
+df["is_male"]   = (df["SEX"] == 1).astype(int)
+df["Sex_label"] = np.where(df["SEX"]==1, "Male", "Female")
+df["BMI"]       = pd.to_numeric(df["BMI"], errors="coerce")
+
+pos = df[df["PTB"]==1].copy()
+neg = df[df["PTB"]==0].copy()
+print(f"PTB+ cases       : {len(pos)}")
+print(f"PTB- controls    : {len(neg)}")
+
+# Alternate allele counts
+def count_alt(geno, alt):
+    if pd.isna(geno): return np.nan
+    return float(sum(a == alt for a in geno.split("/")))
+
+for _, m in SNP_META.iterrows():
+    df[m["SNP"]+"_alt"] = df[m["SNP"]].apply(count_alt, alt=m["Alt"])
+
+pos = df[df["PTB"]==1].copy()
+neg = df[df["PTB"]==0].copy()
+
+# SECTION 2: Table 1 participant characteristics
+print("\n── Table 1: Participant Characteristics ──")
+
+def pct(n, d):   return f"{n} ({100*n/d:.1f}%)" if d else "—"
+def miqr(s):
+    s = s.dropna()
+    return f"{s.median():.1f} ({s.quantile(.25):.1f}–{s.quantile(.75):.1f})"
+def ft2(a, b):
+    _, p = stats.fisher_exact(pd.crosstab(a, b).values)
+    return p
+def mwu(a, b):
+    _, p = stats.mannwhitneyu(a.dropna(), b.dropna(), alternative="two-sided")
+    return p
+
+rows = []
+def row(var, neg_val, pos_val, tot_val="", p=""):
+    rows.append({"Variable": var, "PTB− (Controls)": neg_val,
+                 "PTB+ (Cases)": pos_val, "Total": tot_val, "p-value": p})
+
+row("N (%)", pct(len(neg),len(df)), pct(len(pos),len(df)), str(len(df)))
+
+# LTBI
+ltbi_p = (neg["Latent_TB"]=="Pos").sum()
+ltbi_n = (neg["Latent_TB"]=="Neg").sum()
+ltbi_u = neg["Latent_TB"].isna().sum()
+row("LTBI status (PTB− only)", "", "", "")
+row("  Positive",  pct(ltbi_p, len(neg)), "—")
+row("  Negative",  pct(ltbi_n, len(neg)), "—")
+row("  Unknown",   str(ltbi_u),           "—")
+
+# Age
+p_age = mwu(pos["AGE"], neg["AGE"])
+row("Median age, years (IQR)", miqr(neg["AGE"]), miqr(pos["AGE"]),
+    miqr(df["AGE"]), f"{p_age:.2e}")
+mn = (neg["AGE"]<18).sum(); mp = (pos["AGE"]<18).sum()
+row("  Minors <18 y, n", str(mn), str(mp), str(mn+mp))
+
+# Sex
+p_sex = ft2(df["PTB_label"], df["Sex_label"])
+mn_n=(neg["SEX"]==1).sum(); mn_p=(pos["SEX"]==1).sum()
+fn_n=(neg["SEX"]==2).sum(); fn_p=(pos["SEX"]==2).sum()
+row("Male, n (%)",   pct(mn_n,len(neg)), pct(mn_p,len(pos)),
+    pct(mn_n+mn_p,len(df)), f"{p_sex:.4f}")
+row("Female, n (%)", pct(fn_n,len(neg)), pct(fn_p,len(pos)),
+    pct(fn_n+fn_p,len(df)))
+
+# BMI
+p_bmi = mwu(pos["BMI"], neg["BMI"])
+row("Median BMI, kg/m² (IQR)", miqr(neg["BMI"]), miqr(pos["BMI"]),
+    miqr(df["BMI"]), f"{p_bmi:.3f}")
+bmi_un=(neg["BMI"].isna()).sum(); bmi_up=(pos["BMI"].isna()).sum()
+row("  Unknown, n", str(bmi_un), str(bmi_up), str(bmi_un+bmi_up))
+
+# Smoking
+sm_kn = df.dropna(subset=["smoking"])
+p_sm  = ft2(sm_kn["PTB_label"], sm_kn["smoking"])
+sy_n=(neg["smoking"]=="Yes").sum(); sy_p=(pos["smoking"]=="Yes").sum()
+sd_n=(neg["smoking"].notna()).sum(); sd_p=(pos["smoking"].notna()).sum()
+sm_un=neg["smoking"].isna().sum(); sm_up=pos["smoking"].isna().sum()
+row("Smoking, n (%)",
+    f"{sy_n} ({100*sy_n/sd_n:.0f}%)" if sd_n else "—",
+    f"{sy_p} ({100*sy_p/sd_p:.0f}%)" if sd_p else "—",
+    f"{sy_n+sy_p} ({100*(sy_n+sy_p)/(sd_n+sd_p):.0f}%)", f"{p_sm:.3f}")
+row("  Unknown, n", str(sm_un), str(sm_up), str(sm_un+sm_up))
+
+# Alcohol
+al_kn = df.dropna(subset=["alcohol"])
+p_al  = ft2(al_kn["PTB_label"], al_kn["alcohol"])
+ay_n=(neg["alcohol"]=="Yes").sum(); ay_p=(pos["alcohol"]=="Yes").sum()
+ad_n=(neg["alcohol"].notna()).sum(); ad_p=(pos["alcohol"].notna()).sum()
+al_un=neg["alcohol"].isna().sum(); al_up=pos["alcohol"].isna().sum()
+row("Alcohol use, n (%)",
+    f"{ay_n} ({100*ay_n/ad_n:.0f}%)" if ad_n else "—",
+    f"{ay_p} ({100*ay_p/ad_p:.0f}%)" if ad_p else "—",
+    f"{ay_n+ay_p} ({100*(ay_n+ay_p)/(ad_n+ad_p):.0f}%)", f"{p_al:.3f}")
+row("  Unknown, n", str(al_un), str(al_up), str(al_un+al_up))
+
+# BCG
+bc_kn = df.dropna(subset=["BCG"])
+p_bcg = ft2(bc_kn["PTB_label"], bc_kn["BCG"])
+by_n=(neg["BCG"]=="Yes").sum(); by_p=(pos["BCG"]=="Yes").sum()
+bd_n=(neg["BCG"].notna()).sum(); bd_p=(pos["BCG"].notna()).sum()
+bc_un=neg["BCG"].isna().sum(); bc_up=pos["BCG"].isna().sum()
+row("BCG scar, n (%)",
+    f"{by_n} ({100*by_n/bd_n:.0f}%)" if bd_n else "—",
+    f"{by_p} ({100*by_p/bd_p:.0f}%)" if bd_p else "—",
+    f"{by_n+by_p} ({100*(by_n+by_p)/(bd_n+bd_p):.0f}%)", f"{p_bcg:.3f}")
+row("  Unknown, n", str(bc_un), str(bc_up), str(bc_un+bc_up))
+
+# HIV
+hv_kn = df.dropna(subset=["HIV"])
+p_hiv = ft2(hv_kn["PTB_label"], hv_kn["HIV"])
+hp_n=(neg["HIV"]=="Pos").sum(); hp_p=(pos["HIV"]=="Pos").sum()
+hn_n=(neg["HIV"]=="Neg").sum(); hn_p=(pos["HIV"]=="Neg").sum()
+hd_n=(neg["HIV"].notna()).sum(); hd_p=(pos["HIV"].notna()).sum()
+hv_un=neg["HIV"].isna().sum(); hv_up=pos["HIV"].isna().sum()
+row("HIV status", "", "", "", f"{p_hiv:.3f}")
+row("  Positive, n (%)",
+    f"{hp_n} ({100*hp_n/hd_n:.0f}%)" if hd_n else "—",
+    f"{hp_p} ({100*hp_p/hd_p:.0f}%)" if hd_p else "—",
+    f"{hp_n+hp_p} ({100*(hp_n+hp_p)/len(hv_kn):.0f}%)")
+row("  Negative, n (%)",
+    f"{hn_n} ({100*hn_n/hd_n:.0f}%)" if hd_n else "—",
+    f"{hn_p} ({100*hn_p/hd_p:.0f}%)" if hd_p else "—",
+    f"{hn_n+hn_p} ({100*(hn_n+hn_p)/len(hv_kn):.0f}%)")
+row("  Unknown, n", str(hv_un), str(hv_up), str(hv_un+hv_up))
+
+table1 = pd.DataFrame(rows)
+print(table1.to_string(index=False))
+
+# SECTION 3: Table 2 allele frequencies, call rates, and HWE
+print("\n── Table 2: Allele Frequencies, Call Rates, HWE ──")
+
+t2 = []
+for _, m in SNP_META.iterrows():
+    col = m["SNP"]+"_alt"
+    av = df[col].dropna();  pv = pos[col].dropna(); nv = neg[col].dropna()
+    nt = len(av)
+    af_all = av.sum()/(2*nt);  af_p = pv.sum()/(2*len(pv)); af_n = nv.sum()/(2*len(nv))
+    # Missingness Fisher test
+    mp = pos[col].isna().sum(); mn_ = neg[col].isna().sum()
+    if mp+mn_ > 0:
+        _, p_miss = stats.fisher_exact([[len(pv),mp],[len(nv),mn_]])
+    else:
+        p_miss = 1.0
+    # HWE chi-sq in controls only
+    nc=len(nv); n0=(nv==0).sum(); n1=(nv==1).sum(); n2=(nv==2).sum()
+    p_alt=((2*n2+n1)/(2*nc)); q=1-p_alt
+    e0,e1,e2 = nc*q**2, nc*2*p_alt*q, nc*p_alt**2
+    if all(e>0 for e in [e0,e1,e2]):
+        x2 = (n0-e0)**2/e0+(n1-e1)**2/e1+(n2-e2)**2/e2
+        p_hwe = 1-chi2.cdf(x2, 1)
+    else:
+        p_hwe = np.nan
+    t2.append({"SNP":m["SNP"], "Chr":"2", "Position (hg19)":m["Pos_hg19"],
+               "Ref":m["Ref"], "Alt":m["Alt"],
+               "N genotyped":nt,
+               "Call rate (%)":round(100*nt/len(df),1),
+               "CR PTB+ (%)":round(100*len(pv)/len(pos),1),
+               "CR PTB− (%)":round(100*len(nv)/len(neg),1),
+               "Missingness p":round(p_miss,4),
+               "AF overall":round(af_all,4),
+               "AF PTB+":round(af_p,4),
+               "AF PTB−":round(af_n,4),
+               "HWE p (controls)":round(p_hwe,4) if not np.isnan(p_hwe) else "NA"})
+
+table2 = pd.DataFrame(t2)
+print(table2.to_string(index=False))
+
+# SECTION 4: Table S1 genotype counts
+print("\n── Table S1: Genotype Counts ──")
+
+s1 = []
+for _, m in SNP_META.iterrows():
+    col=m["SNP"]+"_alt"; ref=m["Ref"]; alt=m["Alt"]
+    for lbl,grp in [("PTB+",pos),("PTB-",neg)]:
+        v=grp[col].dropna(); n=len(v)
+        n0=(v==0).sum(); n1=(v==1).sum(); n2=(v==2).sum()
+        s1.append({"SNP":m["SNP"], "Group":lbl, "N genotyped":n,
+                   f"{ref}/{ref} n (%)":f"{n0} ({100*n0/n:.1f}%)" if n else "—",
+                   f"{ref}/{alt} n (%)":f"{n1} ({100*n1/n:.1f}%)" if n else "—",
+                   f"{alt}/{alt} n (%)":f"{n2} ({100*n2/n:.1f}%)" if n else "—"})
+tableS1 = pd.DataFrame(s1)
+
+# SECTION 5: Table 3 primary association analysis
+print("\n── Table 3: Primary Association Analysis ──")
+
+def logistic(data, snp_col, extra=[]):
+    adf = data[["PTB", snp_col, "AGE", "is_male"] + extra].dropna()
+    if len(adf)<10 or adf[snp_col].nunique()<2: return None
+    X = sm.add_constant(adf[[snp_col,"AGE","is_male"]+extra])
+    try:
+        r = sm.Logit(adf["PTB"], X).fit(disp=0, maxiter=200)
+        if snp_col not in r.params: return None
+        b=r.params[snp_col]; ci=r.conf_int().loc[snp_col]; p=r.pvalues[snp_col]
+        return {"OR":round(np.exp(b),3),
+                "95% CI lower":round(np.exp(ci[0]),3),
+                "95% CI upper":round(np.exp(ci[1]),3),
+                "p-value":round(p,4), "N":len(adf)}
+    except: return None
+
+def bh_fdr(pvals):
+    n=len(pvals); order=np.argsort(pvals); fdr=np.empty(n)
+    fdr[order]=pvals[order]*n/(np.arange(n)+1)
+    for i in range(n-2,-1,-1):
+        fdr[order[i]]=min(fdr[order[i]], fdr[order[i+1]])
+    return np.round(np.minimum(fdr,1.0), 4)
+
+def run_assoc(data, label, extra=[]):
+    results=[]
+    for _,m in SNP_META.iterrows():
+        snp=m["SNP"]; base=data[snp+"_alt"]
+        models={"Additive":base,
+                "Dominant":(base>=1).astype(float),
+                "Recessive":(base==2).astype(float),
+                "Overdominant":(base==1).astype(float)}
+        for mname,gcoded in models.items():
+            tmp=data.copy(); tmp["_g"]=gcoded
+            r=logistic(tmp,"_g",extra)
+            if r:
+                # Flag non-convergence / extreme ORs
+                if r["OR"]>100 or r["OR"]<0.001:
+                    r["OR"]=np.nan; r["95% CI lower"]=np.nan
+                    r["95% CI upper"]=np.nan; r["p-value"]=np.nan
+                r.update({"SNP":snp,"Model":mname,"Analysis":label})
+                results.append(r)
+    if not results: return pd.DataFrame()
+    out=pd.DataFrame(results)
+    valid=out["p-value"].notna()
+    out.loc[valid,"FDR"]=bh_fdr(out.loc[valid,"p-value"].values)
+    return out[["SNP","Model","Analysis","OR","95% CI lower","95% CI upper",
+                "p-value","FDR","N"]].sort_values("p-value")
+
+table3 = run_assoc(df, "Primary")
+print(table3.to_string(index=False))
+
+# SECTION 6: Table 4 sensitivity analyses
+print("\n── Table 4: Sensitivity Analyses ──")
+
+df_adults = df[df["AGE"]>=18].copy()
+df_hiv_k  = df.dropna(subset=["HIV"]).copy()
+df_hiv_k["HIV_pos"] = (df_hiv_k["HIV"]=="Pos").astype(float)
+
+for lbl,d in [("Adults ≥18",df_adults),
+              ("HIV-known only",df_hiv_k),
+              ("HIV-adjusted",df_hiv_k)]:
+    p=( d["PTB"]==1).sum(); c=(d["PTB"]==0).sum()
+    print(f"  {lbl:<20}: n={len(d)}  PTB+={p}  PTB-={c}")
+
+s_adults = run_assoc(df_adults, "Adults ≥18 only")
+s_hiv_k  = run_assoc(df_hiv_k,  "HIV-known only")
+s_hiv_a  = run_assoc(df_hiv_k,  "HIV-adjusted", extra=["HIV_pos"])
+
+table4 = pd.concat([s_adults, s_hiv_k, s_hiv_a], ignore_index=True)
+table4 = table4.sort_values(["Analysis","p-value"]).reset_index(drop=True)
+
+# Spotlight: rs2241525 across all analyses
+print("\n  rs2241525 summary across all analyses:")
+spot = pd.concat([
+    table3[table3["SNP"]=="rs2241525"],
+    table4[table4["SNP"]=="rs2241525"]
+], ignore_index=True)
+print(spot[["SNP","Model","Analysis","OR","95% CI lower","95% CI upper",
+            "p-value","FDR","N"]].to_string(index=False))
+
+# SECTION 7: Power analysis
+print("\n── Power Analysis ──")
+
+def allele_power(nc, nk, pc, pk, alpha=0.05):
+    na1=2*nc; na0=2*nk
+    pb=(na1*pc+na0*pk)/(na1+na0)
+    if pb in (0,1): return 0.
+    se0=np.sqrt(pb*(1-pb)*(1/na1+1/na0))
+    se1=np.sqrt(pc*(1-pc)/na1+pk*(1-pk)/na0)
+    if se0==0 or se1==0: return 0.
+    za=stats.norm.ppf(1-alpha/2)
+    return float(stats.norm.cdf((abs(pc-pk)-za*se0)/se1))
+
+pwr_rows=[]
+for maf in [0.10,0.15,0.20,0.25,0.30,0.40,0.50]:
+    for OR in [1.5,2.0,2.5,3.0]:
+        pk=maf; pc=(OR*maf)/(1-maf+OR*maf)
+        pwr_rows.append({"MAF (controls)":maf, "OR":OR,
+                         "N cases":len(pos), "N controls":len(neg),
+                         "Power":round(allele_power(len(pos),len(neg),pc,pk),3)})
+power_table = pd.DataFrame(pwr_rows)
+
+rs_col = "rs2241525_alt"
+afc = pos[rs_col].dropna().sum()/(2*pos[rs_col].notna().sum())
+afk = neg[rs_col].dropna().sum()/(2*neg[rs_col].notna().sum())
+obs_pwr = allele_power(len(pos), len(neg), afc, afk)
+print(f"  n={len(pos)} cases, {len(neg)} controls")
+print(f"  rs2241525: AF_cases={afc:.3f}, AF_controls={afk:.3f}")
+print(f"  Observed post-hoc power: {obs_pwr:.1%}")
+
+# SECTION 8: Build formatted Excel workbook
+print("\n── Writing Excel workbook ──")
+
+wb = Workbook()
+wb.remove(wb.active)  # remove default sheet
+
+# Excel style helpers
+def style_title(cell, text):
+    cell.value = text
+    cell.font = Font(name="Arial", bold=True, size=13, color="FFFFFF")
+    cell.fill = PatternFill("solid", fgColor="1F4E79")
+    cell.alignment = Alignment(horizontal="left", vertical="center",
+                                wrap_text=True)
+
+def style_header(cell):
+    cell.font  = Font(name="Arial", bold=True, size=10, color="FFFFFF")
+    cell.fill  = PatternFill("solid", fgColor="2E75B6")
+    cell.alignment = Alignment(horizontal="center", vertical="center",
+                                wrap_text=True)
+    thin = Side(style="thin", color="FFFFFF")
+    cell.border = Border(left=thin, right=thin, bottom=thin, top=thin)
+
+def style_subheader(cell):
+    cell.font  = Font(name="Arial", bold=True, size=10, color="1F4E79")
+    cell.fill  = PatternFill("solid", fgColor="D6E4F0")
+    cell.alignment = Alignment(horizontal="left", vertical="center")
+
+def style_data(cell, even=True, bold=False, indent=False, highlight=False):
+    cell.font = Font(name="Arial", bold=bold, size=10,
+                     color="C00000" if highlight else "000000")
+    cell.fill = PatternFill("solid", fgColor="EBF3FB" if even else "FFFFFF")
+    xalign = "right" if isinstance(cell.value, (int,float)) else "left"
+    cell.alignment = Alignment(horizontal=xalign, vertical="center",
+                                indent=2 if indent else 0)
+    thin = Side(style="thin", color="D9D9D9")
+    cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+
+def set_col_widths(ws, widths):
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+
+def freeze(ws, cell="A3"):
+    ws.freeze_panes = ws[cell]
+
+def add_title_row(ws, title, ncols):
+    ws.append([title])
+    ws.merge_cells(start_row=ws.max_row, start_column=1,
+                   end_row=ws.max_row, end_column=ncols)
+    style_title(ws.cell(ws.max_row, 1), title)
+    ws.row_dimensions[ws.max_row].height = 24
+
+
+# Sheet 1: demographics
+ws1 = wb.create_sheet("Table 1 – Demographics")
+cols1 = list(table1.columns)
+add_title_row(ws1, "Table 1. Participant Characteristics of the SP110 Pilot Cohort (n=134)", len(cols1))
+ws1.append(cols1)
+for c in range(1, len(cols1)+1):
+    style_header(ws1.cell(ws1.max_row, c))
+ws1.row_dimensions[ws1.max_row].height = 30
+
+SUBHEADERS1 = {"LTBI status (PTB− only)", "HIV status"}
+INDENT_ROWS1 = {r["Variable"] for r in rows if r["Variable"].startswith("  ")}
+HIGHLIGHT_ROWS1 = {"Median age, years (IQR)", "Male, n (%)", "Median BMI, kg/m² (IQR)"}
+
+for i, r in table1.iterrows():
+    ws1.append(list(r))
+    cur = ws1.max_row
+    is_sub = r["Variable"] in SUBHEADERS1
+    is_indent = r["Variable"] in INDENT_ROWS1
+    is_hi = r["Variable"] in HIGHLIGHT_ROWS1
+    for c in range(1, len(cols1)+1):
+        cell = ws1.cell(cur, c)
+        if is_sub:
+            style_subheader(cell)
+        else:
+            style_data(cell, even=(i%2==0), bold=is_hi,
+                       indent=is_indent, highlight=False)
+        # p-value column: bold if significant
+        if c == len(cols1) and r["p-value"] not in ("","—"):
+            try:
+                pv = float(r["p-value"].replace("e","e"))
+                if pv < 0.05:
+                    cell.font = Font(name="Arial", bold=True, size=10,
+                                     color="C00000")
+            except: pass
+
+set_col_widths(ws1, {"A":38,"B":22,"C":22,"D":18,"E":12})
+freeze(ws1, "A3")
+
+# Sheet 2: allele frequencies and HWE
+ws2 = wb.create_sheet("Table 2 – Allele Freq & HWE")
+cols2 = list(table2.columns)
+add_title_row(ws2, "Table 2. SP110 SNP Allele Frequencies, Call Rates, and Hardy–Weinberg Equilibrium (GRCh37/hg19)", len(cols2))
+ws2.append(cols2)
+for c in range(1, len(cols2)+1):
+    style_header(ws2.cell(ws2.max_row, c))
+ws2.row_dimensions[ws2.max_row].height = 42
+
+for i, r in table2.iterrows():
+    ws2.append(list(r))
+    cur = ws2.max_row
+    for c_idx, col in enumerate(cols2, 1):
+        cell = ws2.cell(cur, c_idx)
+        style_data(cell, even=(i%2==0))
+        # Highlight rs2241525 row
+        if r["SNP"] == "rs2241525":
+            cell.fill = PatternFill("solid", fgColor="FFF2CC")
+            cell.font = Font(name="Arial", bold=True, size=10)
+        # Flag HWE p < 0.05 in red
+        if col == "HWE p (controls)" and r[col] != "NA":
+            try:
+                if float(r[col]) < 0.05:
+                    cell.font = Font(name="Arial", bold=True, size=10,
+                                     color="C00000")
+            except: pass
+
+set_col_widths(ws2, {"A":12,"B":5,"C":16,"D":5,"E":5,"F":12,"G":13,
+                      "H":12,"I":12,"J":14,"K":11,"L":9,"M":9,"N":18})
+freeze(ws2, "A3")
+
+# Sheet 3: primary association analysis
+ws3 = wb.create_sheet("Table 3 – Primary Assoc")
+cols3 = list(table3.columns)
+add_title_row(ws3, "Table 3. Primary Association Analysis: SP110 SNPs and PTB Susceptibility (n=134)", len(cols3))
+ws3.append(cols3)
+for c in range(1, len(cols3)+1):
+    style_header(ws3.cell(ws3.max_row, c))
+ws3.row_dimensions[ws3.max_row].height = 30
+
+for i, r in table3.iterrows():
+    ws3.append(list(r))
+    cur = ws3.max_row
+    is_rs = r["SNP"] == "rs2241525"
+    for c_idx, col in enumerate(cols3, 1):
+        cell = ws3.cell(cur, c_idx)
+        style_data(cell, even=(i%2==0), bold=is_rs)
+        if is_rs:
+            cell.fill = PatternFill("solid", fgColor="FFF2CC")
+        # p < 0.05: red
+        if col == "p-value" and pd.notna(r[col]):
+            try:
+                if float(r[col]) < 0.05:
+                    cell.font = Font(name="Arial", bold=True, size=10,
+                                     color="C00000")
+            except: pass
+
+set_col_widths(ws3, {"A":12,"B":14,"C":12,"D":9,"E":12,"F":12,"G":10,"H":8,"I":6})
+freeze(ws3, "A3")
+
+# Sheet 4: sensitivity analyses
+ws4 = wb.create_sheet("Table 4 – Sensitivity")
+cols4 = list(table4.columns)
+add_title_row(ws4, "Table 4. Sensitivity Analyses: SP110 SNPs and PTB Susceptibility", len(cols4))
+ws4.append(cols4)
+for c in range(1, len(cols4)+1):
+    style_header(ws4.cell(ws4.max_row, c))
+ws4.row_dimensions[ws4.max_row].height = 30
+
+analysis_colors = {
+    "Adults ≥18 only":  "E2EFDA",
+    "HIV-known only":   "FCE4D6",
+    "HIV-adjusted":     "EAD1DC",
+}
+for i, r in table4.iterrows():
+    ws4.append(list(r))
+    cur = ws4.max_row
+    is_rs = r["SNP"] == "rs2241525"
+    bg = analysis_colors.get(r["Analysis"], "FFFFFF")
+    for c_idx, col in enumerate(cols4, 1):
+        cell = ws4.cell(cur, c_idx)
+        style_data(cell, even=True, bold=is_rs)
+        cell.fill = PatternFill("solid", fgColor=bg)
+        if is_rs:
+            cell.font = Font(name="Arial", bold=True, size=10)
+        if col == "p-value" and pd.notna(r.get(col)):
+            try:
+                if float(r[col]) < 0.05:
+                    cell.font = Font(name="Arial", bold=True, size=10,
+                                     color="C00000")
+            except: pass
+
+set_col_widths(ws4, {"A":12,"B":14,"C":20,"D":9,"E":12,"F":12,"G":10,"H":8,"I":6})
+freeze(ws4, "A3")
+
+# Sheet 5: genotype counts
+ws5 = wb.create_sheet("Table S1 – Genotype Counts")
+cols5 = list(tableS1.columns)
+add_title_row(ws5, "Table S1. Genotype Counts by PTB Status for all 10 SP110 SNPs", len(cols5))
+ws5.append(cols5)
+for c in range(1, len(cols5)+1):
+    style_header(ws5.cell(ws5.max_row, c))
+ws5.row_dimensions[ws5.max_row].height = 30
+
+last_snp = None
+for i, r in tableS1.iterrows():
+    ws5.append(list(r))
+    cur = ws5.max_row
+    even = (list(SNP_META["SNP"]).index(r["SNP"]) % 2 == 0)
+    for c_idx in range(1, len(cols5)+1):
+        cell = ws5.cell(cur, c_idx)
+        style_data(cell, even=even)
+        if r["SNP"] == "rs2241525":
+            cell.fill = PatternFill("solid", fgColor="FFF2CC")
+            cell.font = Font(name="Arial", bold=True, size=10)
+
+set_col_widths(ws5, {"A":12,"B":8,"C":14,"D":18,"E":18,"F":18})
+freeze(ws5, "A3")
+
+# Sheet 6: power analysis
+ws6 = wb.create_sheet("Power Analysis")
+cols6 = list(power_table.columns)
+add_title_row(ws6, f"Post-hoc Statistical Power  |  n={len(pos)} cases, {len(neg)} controls  |  "
+              f"rs2241525 observed power: {obs_pwr:.0%}  (AF_cases={afc:.3f}, AF_controls={afk:.3f})",
+              len(cols6))
+ws6.append(cols6)
+for c in range(1, len(cols6)+1):
+    style_header(ws6.cell(ws6.max_row, c))
+ws6.row_dimensions[ws6.max_row].height = 30
+
+for i, r in power_table.iterrows():
+    ws6.append(list(r))
+    cur = ws6.max_row
+    for c_idx, col in enumerate(cols6, 1):
+        cell = ws6.cell(cur, c_idx)
+        style_data(cell, even=(i%2==0))
+        if col == "Power":
+            p = r[col]
+            if p >= 0.80:
+                cell.fill = PatternFill("solid", fgColor="C6EFCE")
+                cell.font = Font(name="Arial", bold=True, size=10, color="276227")
+            elif p >= 0.50:
+                cell.fill = PatternFill("solid", fgColor="FFEB9C")
+                cell.font = Font(name="Arial", size=10, color="9C6500")
+            else:
+                cell.fill = PatternFill("solid", fgColor="FFC7CE")
+                cell.font = Font(name="Arial", size=10, color="9C0006")
+
+set_col_widths(ws6, {"A":16,"B":6,"C":10,"D":12,"E":8})
+freeze(ws6, "A3")
+
+# Sheet 7: deduplication log
+ws7 = wb.create_sheet("Deduplication Log")
+add_title_row(ws7, "Deduplication Log — Records Removed Before Analysis", 4)
+ws7.append(["Duplicate record", "Action", "Reason", "Public note"])
+for c in range(1, 5):
+    style_header(ws7.cell(ws7.max_row, c))
+
+if DUP_RECORDS:
+    for idx, rec in enumerate(DUP_RECORDS, start=1):
+        ws7.append([
+            f"Duplicate {idx}",
+            "Removed before analysis",
+            "Duplicate record identified before analysis",
+            "Participant identifiers and private duplicate notes are intentionally not shown in this public workbook.",
+        ])
+        cur = ws7.max_row
+        for c in range(1, 5):
+            style_data(ws7.cell(cur, c), even=(cur % 2 == 0))
+else:
+    ws7.append(["—", "No records removed", "No duplicate-removal file supplied", "—"])
+    cur = ws7.max_row
+    for c in range(1, 5):
+        style_data(ws7.cell(cur, c), even=True)
+
+set_col_widths(ws7, {"A":18, "B":24, "C":58, "D":64})
+
+# Save outputs
+wb.save(XLSX_OUT)
+print(f"\n  Workbook saved → {XLSX_OUT}")
+
+# Also save individual CSVs
+for tbl, name in [(table1,"Table1_Demographics.csv"),
+                   (table2,"Table2_AlleleFreq_HWE.csv"),
+                   (table3,"Table3_Association_Primary.csv"),
+                   (table4,"Table4_Sensitivity_Analyses.csv"),
+                   (tableS1,"TableS1_Genotype_Counts.csv"),
+                   (power_table,"Power_Analysis.csv")]:
+    tbl.to_csv(os.path.join(OUTDIR, name), index=False)
+    print(f"  CSV saved     → {name}")
+
+print("\n" + "="*60)
+print("DONE")
+print("="*60)
